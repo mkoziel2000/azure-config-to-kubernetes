@@ -21,18 +21,18 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/SparebankenVest/azure-key-vault-to-kubernetes/cmd/azure-keyvault-secrets-webhook/auth"
 	"github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/docker/registry"
 	"github.com/spf13/viper"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -65,14 +65,36 @@ func (p podWebHook) getInitContainers() []corev1.Container {
 	container := corev1.Container{
 		Name:            "copy-azurekeyvault-env",
 		Image:           viper.GetString("azurekeyvault_env_image"),
-		ImagePullPolicy: corev1.PullIfNotPresent,
+		ImagePullPolicy: corev1.PullPolicy(viper.GetString("webhook_container_image_pull_policy")),
 		Command:         []string{"sh", "-c", cmd},
+		SecurityContext: &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+			ReadOnlyRootFilesystem: &[]bool{viper.GetBool("webhook_container_security_context_read_only")}[0],
+			RunAsNonRoot:           &[]bool{viper.GetBool("webhook_container_security_context_non_root")}[0],
+			Privileged:             &[]bool{viper.GetBool("webhook_container_security_context_privileged")}[0],
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      initContainerVolumeName,
 				MountPath: p.injectorDir,
 			},
 		},
+	}
+	if viper.IsSet("webhook_container_security_context_allow_privilege_escalation") {
+		container.SecurityContext.AllowPrivilegeEscalation = &[]bool{viper.GetBool("webhook_container_security_context_allow_privilege_escalation")}[0]
+	}
+	if viper.IsSet("webhook_container_security_context_user_uid") {
+		container.SecurityContext.RunAsUser = &[]int64{viper.GetInt64("webhook_container_security_context_user_uid")}[0]
+	}
+	if viper.IsSet("webhook_container_security_context_group_gid") {
+		container.SecurityContext.RunAsGroup = &[]int64{viper.GetInt64("webhook_container_security_context_group_gid")}[0]
+	}
+	if viper.IsSet("webhook_container_security_context_seccomp_runtime_default") && viper.GetBool("webhook_container_security_context_seccomp_runtime_default") {
+		container.SecurityContext.SeccompProfile = &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		}
 	}
 
 	return []corev1.Container{container}
@@ -201,18 +223,6 @@ func (p podWebHook) mutateContainers(ctx context.Context, containers []corev1.Co
 		}...)
 
 		if useAuthService {
-			_, err := p.clientset.CoreV1().Secrets(p.namespace).Create(context.TODO(), authServiceSecret, metav1.CreateOptions{})
-			if err != nil {
-				if errors.IsAlreadyExists(err) {
-					_, err = p.clientset.CoreV1().Secrets(p.namespace).Update(context.TODO(), authServiceSecret, metav1.UpdateOptions{})
-					if err != nil {
-						return false, err
-					}
-				} else {
-					return false, err
-				}
-			}
-
 			container.VolumeMounts = append(container.VolumeMounts, []corev1.VolumeMount{
 				{
 					Name:      authSecretVolumeName,
@@ -289,6 +299,21 @@ func (p podWebHook) mutatePodSpec(ctx context.Context, pod *corev1.Pod) error {
 		}
 	}
 
+	if p.useAuthService && (len(podSpec.InitContainers) > 0 || len(podSpec.Containers) > 0) {
+		klog.InfoS("create authentication service secret", klog.KRef(p.namespace, pod.Name))
+		_, err := p.clientset.CoreV1().Secrets(p.namespace).Create(context.TODO(), authServiceSecret, metav1.CreateOptions{})
+		if err != nil {
+			if errors.IsAlreadyExists(err) {
+				_, err = p.clientset.CoreV1().Secrets(p.namespace).Update(context.TODO(), authServiceSecret, metav1.UpdateOptions{})
+				if err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+	}
+
 	klog.InfoS("mutate init-containers", klog.KRef(p.namespace, pod.Name))
 	initContainersMutated, err := p.mutateContainers(ctx, podSpec.InitContainers, podSpec, authServiceSecret)
 	if err != nil {
@@ -318,7 +343,7 @@ func (p podWebHook) currentNamespace() string {
 		return ns
 	}
 
-	if data, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
+	if data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
 		if ns := strings.TrimSpace(string(data)); len(ns) > 0 {
 			return ns
 		}

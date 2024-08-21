@@ -37,11 +37,12 @@ import (
 )
 
 func (c *Controller) initAzureKeyVaultSecret() {
-	c.akvsInformerFactory.AzureKeyVault().V2beta1().AzureKeyVaultSecrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := c.akvsInformerFactory.AzureKeyVault().V2beta1().AzureKeyVaultSecrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			akvs, err := convertToAzureKeyVaultSecret(obj)
 			if err != nil {
 				klog.ErrorS(err, "failed to convert to azurekeyvaultsecret")
+				syncFailures.WithLabelValues("add", "AzureKeyVaultSecret").Inc()
 				return
 			}
 
@@ -55,12 +56,14 @@ func (c *Controller) initAzureKeyVaultSecret() {
 			newAkvs, err := convertToAzureKeyVaultSecret(new)
 			if err != nil {
 				klog.ErrorS(err, "failed to convert to azurekeyvaultsecret")
+				syncFailures.WithLabelValues("update", "AzureKeyVault").Inc()
 				return
 			}
 
 			oldAkvs, err := convertToAzureKeyVaultSecret(old)
 			if err != nil {
 				klog.ErrorS(err, "failed to convert to azurekeyvaultsecret")
+				syncFailures.WithLabelValues("update", "AzureKeyVault").Inc()
 				return
 			}
 
@@ -82,6 +85,7 @@ func (c *Controller) initAzureKeyVaultSecret() {
 			akvs, err := convertToAzureKeyVaultSecret(obj)
 			if err != nil {
 				klog.ErrorS(err, "failed to convert to azurekeyvaultsecret")
+				syncFailures.WithLabelValues("delete", "AzureKeyVaultSecret").Inc()
 				return
 			}
 
@@ -93,6 +97,7 @@ func (c *Controller) initAzureKeyVaultSecret() {
 				err = c.deleteKubernetesValues(akvs)
 				if err != nil {
 					klog.ErrorS(err, "failed to delete secret data from azurekeyvaultsecret", "azurekeyvaultsecret", klog.KObj(akvs))
+					syncFailures.WithLabelValues("delete", "AzureKeyVaultSecret").Inc()
 				}
 
 				// Getting default key to remove from Azure work queue
@@ -105,6 +110,9 @@ func (c *Controller) initAzureKeyVaultSecret() {
 			}
 		},
 	})
+	if err != nil {
+		klog.ErrorS(err, "unable to add event handler")
+	}
 }
 
 func (c *Controller) syncDeletedAzureKeyVaultSecret(key string) error {
@@ -127,7 +135,6 @@ func (c *Controller) syncDeletedAzureKeyVaultSecret(key string) error {
 		}
 
 		klog.V(4).InfoS("sync successful", "azurekeyvaultsecret", klog.KObj(akvs), "secret", klog.KObj(secret))
-		c.recorder.Event(secret, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSynced)
 		outputObject = secret
 	}
 
@@ -138,7 +145,6 @@ func (c *Controller) syncDeletedAzureKeyVaultSecret(key string) error {
 		}
 
 		klog.V(4).InfoS("sync successful", "azurekeyvaultsecret", klog.KObj(akvs), "configmap", klog.KObj(cm))
-		c.recorder.Event(cm, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSynced)
 		outputObject = cm
 	}
 
@@ -171,7 +177,6 @@ func (c *Controller) syncAzureKeyVaultSecret(key string) error {
 		}
 
 		klog.V(4).InfoS("sync successful", "azurekeyvaultsecret", klog.KObj(akvs), "secret", klog.KObj(secret))
-		c.recorder.Event(secret, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSynced)
 		outputObject = secret
 	}
 
@@ -182,7 +187,6 @@ func (c *Controller) syncAzureKeyVaultSecret(key string) error {
 		}
 
 		klog.V(4).InfoS("sync successful", "azurekeyvaultsecret", klog.KObj(akvs), "configmap", klog.KObj(cm))
-		c.recorder.Event(cm, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSynced)
 		outputObject = cm
 	}
 
@@ -215,8 +219,9 @@ func (c *Controller) syncAzureKeyVault(key string) error {
 		klog.V(4).InfoS("getting secret value from azure key vault", "azurekeyvaultsecret", klog.KObj(akvs))
 		secretValue, err := c.getSecretFromKeyVault(akvs)
 		if err != nil {
-			msg := fmt.Sprintf(FailedAzureKeyVault, akvs.Name, akvs.Spec.Vault.Name)
+			msg := fmt.Sprintf(FailedAzureKeyVault, akvs.Name, akvs.Spec.Vault.Name, err.Error())
 			c.recorder.Event(akvs, corev1.EventTypeWarning, ErrAzureVault, msg)
+			syncFailures.WithLabelValues("sync", "AzureKeyVault").Inc()
 			return fmt.Errorf(msg)
 		}
 
@@ -249,6 +254,7 @@ func (c *Controller) syncAzureKeyVault(key string) error {
 				}
 
 				secretName = secret.Name
+				c.recorder.Event(akvs, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSyncedWithAzureKeyVault)
 				klog.InfoS("secret changed - any resources (like pods) using this secret must be restarted to pick up the new value - details: https://github.com/kubernetes/kubernetes/issues/22368", "azurekeyvaultsecret", klog.KObj(secret), "secret", klog.KObj(akvs))
 			}
 		}
@@ -258,7 +264,7 @@ func (c *Controller) syncAzureKeyVault(key string) error {
 		klog.V(4).InfoS("getting secret value from azure key vault", "azurekeyvaultsecret", klog.KObj(akvs))
 		cmValue, err := c.getConfigMapFromKeyVault(akvs)
 		if err != nil {
-			msg := fmt.Sprintf(FailedAzureKeyVault, akvs.Name, akvs.Spec.Vault.Name)
+			msg := fmt.Sprintf(FailedAzureKeyVault, akvs.Name, akvs.Spec.Vault.Name, err.Error())
 			c.recorder.Event(akvs, corev1.EventTypeWarning, ErrAzureVault, msg)
 			return fmt.Errorf(msg)
 		}
@@ -290,6 +296,7 @@ func (c *Controller) syncAzureKeyVault(key string) error {
 					return fmt.Errorf("failed to update configmap, error: %+v", err)
 				}
 				cmName = cm.Name
+				c.recorder.Event(akvs, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSyncedWithAzureKeyVault)
 				klog.InfoS("configmap changed - any resources (like pods) using this configmap must be restarted to pick up the new value - details: https://github.com/kubernetes/kubernetes/issues/22368", "azurekeyvaultsecret", klog.KObj(akvs), "configmap", klog.KObj(cm))
 			}
 		}
@@ -301,7 +308,6 @@ func (c *Controller) syncAzureKeyVault(key string) error {
 	}
 
 	klog.V(4).InfoS("sync successful", "azurekeyvaultsecret", klog.KObj(akvs))
-	c.recorder.Event(akvs, corev1.EventTypeNormal, SuccessSynced, MessageAzureKeyVaultSecretSyncedWithAzureKeyVault)
 	return nil
 }
 
@@ -340,23 +346,6 @@ func (c *Controller) akvsHasOutputSecret(secret *akv.AzureKeyVaultSecret) bool {
 
 func (c *Controller) akvsHasOutputConfigMap(secret *akv.AzureKeyVaultSecret) bool {
 	return secret.Spec.Output.ConfigMap.Name != ""
-}
-
-func (c *Controller) getAzureKeyVaultSecretFromSecret(secret *corev1.Secret, owner *metav1.OwnerReference) (*akv.AzureKeyVaultSecret, error) {
-	return c.azureKeyVaultSecretLister.AzureKeyVaultSecrets(secret.Namespace).Get(owner.Name)
-}
-
-func (c *Controller) getAzureKeyVaultSecretFromConfigMap(cm *corev1.ConfigMap, owner *metav1.OwnerReference) (*akv.AzureKeyVaultSecret, error) {
-	return c.azureKeyVaultSecretLister.AzureKeyVaultSecrets(cm.Namespace).Get(owner.Name)
-}
-
-func (c *Controller) isOwnedByAzureKeyVaultSecret(obj metav1.Object) bool {
-	if ownerRef := metav1.GetControllerOf(obj); ownerRef != nil {
-		if ownerRef.Kind == "AzureKeyVaultSecret" {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *Controller) getSecretFromKeyVault(azureKeyVaultSecret *akv.AzureKeyVaultSecret) (map[string][]byte, error) {

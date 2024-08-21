@@ -23,26 +23,23 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/akv2k8s"
 	"github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/akv2k8s/transformers"
+	"github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/azure"
+	"github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/azure/credentialprovider"
 	vault "github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/azure/keyvault/client"
 	akv "github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/k8s/apis/azurekeyvault/v2beta1"
 	clientset "github.com/SparebankenVest/azure-key-vault-to-kubernetes/pkg/k8s/client/clientset/versioned"
 	"github.com/spf13/viper"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
-	componentBaseConfig "k8s.io/component-base/config"
+	logConfig "k8s.io/component-base/logs/api/v1"
 	jsonlogs "k8s.io/component-base/logs/json"
 	"k8s.io/klog/v2"
-)
-
-const (
-	envLookupRegex = `^([a-z-\d]*)@azurekeyvault([\?]?[a-z-\d]*)$`
 )
 
 type injectorConfig struct {
@@ -160,7 +157,10 @@ func main() {
 
 	if logFormat == "json" {
 		loggerFactory := jsonlogs.Factory{}
-		logger, _ := loggerFactory.Create(componentBaseConfig.FormatOptions{})
+		logger, _ := loggerFactory.Create(*logConfig.NewLoggingConfiguration(), logConfig.LoggingOptions{
+			ErrorStream: os.Stderr,
+			InfoStream:  os.Stdout,
+		})
 		klog.SetLogger(logger)
 	}
 
@@ -253,25 +253,29 @@ func main() {
 		klog.InfoS("found original container command", "cmd", origCommand, "args", origArgs)
 	}
 
-	creds, err := getCredentials(config.useAuthService, config.authServiceAddress, config.authServiceValidationAddress, config.clientCertDir)
-
-	if err != nil {
-		klog.V(4).InfoS("failed to get credentials, will retry", "retryTimes", config.retryTimes)
-		err = retry(config.retryTimes, time.Second*time.Duration(config.waitTimeBetweenRetries), func() error {
-			creds, err = getCredentials(config.useAuthService, config.authServiceAddress, config.authServiceValidationAddress, config.clientCertDir)
-			if err != nil {
-				return err
-			}
-			klog.Info("succeeded getting credentials")
-			return nil
-		})
+	var creds azure.LegacyTokenCredential
+	var keyVaultDNSSuffix string
+	if config.useAuthService {
+		provider, err := credentialprovider.NewFromEnvironment()
+		if err != nil {
+			klog.ErrorS(err, "failed to get provider from environment", "failedTimes", config.retryTimes)
+			os.Exit(1)
+		}
+		keyVaultDNSSuffix = provider.GetAzureKeyVaultDNSSuffix()
+		creds, err = getCredentialsAuthService(config.authServiceAddress, config.authServiceValidationAddress, config.clientCertDir)
+		if err != nil {
+			klog.ErrorS(err, "failed to get credentials", "failedTimes", config.retryTimes)
+			os.Exit(1)
+		}
+	} else {
+		creds, keyVaultDNSSuffix, err = getCredentials()
 		if err != nil {
 			klog.ErrorS(err, "failed to get credentials", "failedTimes", config.retryTimes)
 			os.Exit(1)
 		}
 	}
 
-	vaultService := vault.NewService(creds)
+	vaultService := vault.NewService(creds, keyVaultDNSSuffix)
 
 	klog.V(4).InfoS("reading azurekeyvaultsecret's referenced in env variables")
 	cfg, err := rest.InClusterConfig()
@@ -288,73 +292,51 @@ func main() {
 
 	environ := os.Environ()
 
-	re := regexp.MustCompile(envLookupRegex)
+	variables, err := parseEnvVars(environ)
+	if err != nil {
+		klog.ErrorS(err, "error extracting environment variables to inject")
+		os.Exit(1)
+	}
 
-	for i, env := range environ {
-		split := strings.SplitN(env, "=", 2)
-		name := split[0]
-		value := split[1]
+	for name, values := range variables {
+		akvsName := values.akvsName
+		secretQuery := values.query
+		index := values.index
 
-		regexMatches := re.FindAllStringSubmatch(value, -1)
+		klog.V(4).InfoS("getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
+		akvs, err := azureKeyVaultSecretClient.AzureKeyVaultV2beta1().AzureKeyVaultSecrets(config.namespace).Get(context.TODO(), akvsName, v1.GetOptions{})
+		if err != nil {
+			klog.ErrorS(err, "failed to get azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
+			klog.InfoS("will retry getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName), "retryTimes", config.retryTimes, "delay", config.waitTimeBetweenRetries)
 
-		// e.g. my-akv-secret-name@azurekeyvault?some-sub-key
-		for _, match := range regexMatches {
-			// e.g. my-akv-secret-name?some-sub-key
-			klog.V(4).InfoS("found env var to get azure key vault secret for", "env", name)
-
-			akvsName := strings.Join(match[1:], "")
-
-			if akvsName == "" {
-				klog.ErrorS(fmt.Errorf("error extracting secret name"), "env variable not properly formatted", "env", name, "value", value)
-				os.Exit(1)
-			}
-
-			var secretQuery string
-			if query := strings.Split(akvsName, "?"); len(query) > 1 {
-				if len(query) > 2 {
-					klog.ErrorS(fmt.Errorf("error extracting secret query"), "multiple query elements defined with '?' - only one supported", "secret", akvsName)
-					os.Exit(1)
-				}
-				akvsName = query[0]
-				secretQuery = query[1]
-				klog.V(4).InfoS("found query in env var", "env", name, "value", value, "query", secretQuery)
-			}
-
-			klog.V(4).InfoS("getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
-			akvs, err := azureKeyVaultSecretClient.AzureKeyVaultV2beta1().AzureKeyVaultSecrets(config.namespace).Get(context.TODO(), akvsName, v1.GetOptions{})
-			if err != nil {
-				klog.ErrorS(err, "failed to get azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
-				klog.InfoS("will retry getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName), "retryTimes", config.retryTimes, "delay", config.waitTimeBetweenRetries)
-
-				err = retry(config.retryTimes, time.Second*time.Duration(config.waitTimeBetweenRetries), func() error {
-					akvs, err = azureKeyVaultSecretClient.AzureKeyVaultV2beta1().AzureKeyVaultSecrets(config.namespace).Get(context.TODO(), akvsName, v1.GetOptions{})
-					if err != nil {
-						klog.V(4).ErrorS(err, "error getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
-						return err
-					}
-					klog.InfoS("succeeded getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KObj(akvs))
-					return nil
-				})
+			err = retry(config.retryTimes, time.Second*time.Duration(config.waitTimeBetweenRetries), func() error {
+				akvs, err = azureKeyVaultSecretClient.AzureKeyVaultV2beta1().AzureKeyVaultSecrets(config.namespace).Get(context.TODO(), akvsName, v1.GetOptions{})
 				if err != nil {
-					klog.ErrorS(err, "error getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
-					os.Exit(1)
+					klog.V(4).ErrorS(err, "error getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
+					return err
 				}
-			}
-
-			klog.V(4).InfoS("getting secret value for from azure key vault, to inject into env var", "azurekeyvaultsecret", klog.KObj(akvs), "env", name)
-			secret, err := getSecretFromKeyVault(akvs, secretQuery, vaultService)
+				klog.InfoS("succeeded getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KObj(akvs))
+				return nil
+			})
 			if err != nil {
-				klog.ErrorS(err, "failed to read secret from azure key vault", "azurekeyvaultsecret", klog.KObj(akvs))
+				klog.ErrorS(err, "error getting azurekeyvaultsecret", "azurekeyvaultsecret", klog.KRef(config.namespace, akvsName))
 				os.Exit(1)
 			}
+		}
 
-			if secret == "" {
-				klog.ErrorS(fmt.Errorf("secret value empty"), "secret not found in azure key vault", "azurekeyvaultsecret", klog.KObj(akvs))
-				os.Exit(1)
-			} else {
-				klog.InfoS("secret injected into env var", "azurekeyvaultsecret", klog.KObj(akvs), "env", name)
-				environ[i] = fmt.Sprintf("%s=%s", name, secret)
-			}
+		klog.V(4).InfoS("getting secret value for from azure key vault, to inject into env var", "azurekeyvaultsecret", klog.KObj(akvs), "env", name)
+		secret, err := getSecretFromKeyVault(akvs, secretQuery, vaultService)
+		if err != nil {
+			klog.ErrorS(err, "failed to read secret from azure key vault", "azurekeyvaultsecret", klog.KObj(akvs))
+			os.Exit(1)
+		}
+
+		if secret == "" {
+			klog.ErrorS(fmt.Errorf("secret value empty"), "secret not found in azure key vault", "azurekeyvaultsecret", klog.KObj(akvs))
+			os.Exit(1)
+		} else {
+			klog.InfoS("secret injected into env var", "azurekeyvaultsecret", klog.KObj(akvs), "env", name)
+			environ[index] = fmt.Sprintf("%s=%s", name, secret)
 		}
 	}
 
